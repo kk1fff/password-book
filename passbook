@@ -1,0 +1,206 @@
+#!/usr/bin/env python
+
+import sys, os, getpass, tempfile, shutil, subprocess, threading
+
+def print_err(msg):
+    sys.stderr.write(msg + '\n')
+    
+PRINTABLES = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def RandomString(length):
+    return ''.join(map(lambda x: PRINTABLES[ord(x)%len(PRINTABLES)], os.urandom(length)))
+
+
+class IOPumpThread(threading.Thread):
+    def __init__(self, in_file_obj, out_file_obj):
+        threading.Thread.__init__(self)
+        self._in = in_file_obj
+        self._out = out_file_obj
+
+    def run(self):
+        while True:
+            b = self._in.read(1024)
+            self._out.write(b)
+            if len(b) < 1024:
+                self._out.close()
+                break
+
+def OpenSSLEncode(in_file, to_file, password):
+    pass_dir = tempfile.mkdtemp()
+    pass_file = os.path.join(pass_dir, 'fifo')
+    os.mkfifo(pass_file)
+
+    ossl = subprocess.Popen(['openssl',
+                             'aes-256-cbc',
+                             '-salt',
+                             '-e',
+                             '-out', to_file,
+                             '-pass', 'file:{}'.format(pass_file)],
+                            stdin=subprocess.PIPE)
+    pass_f = open(pass_file, "w", 1)
+    pass_f.write(password)
+    pass_f.close()
+
+    cpz = subprocess.Popen(['bzip2',
+                            '-cz', # compress to stdout
+                            in_file],
+                           stdout=subprocess.PIPE)
+    pump = IOPumpThread(cpz.stdout, ossl.stdin)
+    pump.start()
+    pump.join()
+
+    cpz.wait()
+    ossl.wait()
+    shutil.rmtree(pass_dir)
+
+def OpenSSLDecode(in_file, to_file, password):
+    pass_dir = tempfile.mkdtemp()
+    pass_file = os.path.join(pass_dir, 'fifo')
+    os.mkfifo(pass_file)
+
+    ossl = subprocess.Popen(['openssl',
+                             'aes-256-cbc',
+                             '-d',
+                             '-in', in_file,
+                             '-pass', 'file:{}'.format(pass_file)],
+                            stdout=subprocess.PIPE)
+
+    pass_f = open(pass_file, "w", 1)
+    pass_f.write(password)
+    pass_f.close()
+
+    cpz = subprocess.Popen(['bzip2', '-d'],
+                           stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE)
+    secretToPlainPump = IOPumpThread(ossl.stdout, cpz.stdin)
+    secretToPlainPump.start()
+
+    to = open(to_file, 'w')
+    decodePump = IOPumpThread(cpz.stdout, to)
+    decodePump.start()
+
+    secretToPlainPump.join()
+    decodePump.join()
+    
+    cpz.wait()
+    ossl.wait()
+    shutil.rmtree(pass_dir)
+    
+# There's no plain file left after each public function executed.
+class SecretFile:
+    def __init__(self):
+        self._plain_filename = None
+        self._plain_base = None
+        self._pass = None
+        self._secret_filename = None
+
+    def _clean_plain(self):
+        if self._plain_base == None:
+            return
+
+        if os.path.isfile(self._plain_base):
+            os.remove(self._plain_base)
+        else:
+            shutil.rmtree(self._plain_base)
+        self._plain_base = None
+        self._plain_filename = None
+
+    # Launch editor to edit the decoded version of secret.
+    # This function assumes there's already a decoded plain file name given.
+    def _edit_plain(self):
+        if self._plain_filename == None:
+            raise Exception("Filename of plain file required")
+
+        if os.system('$EDITOR {}'.format(self._plain_filename)) == 0:
+            return True
+        return False
+
+    def _encode(self):
+        OpenSSLEncode(self._plain_filename,
+                      self._secret_filename,
+                      self._pass)
+
+    def _decode(self):
+        if self._plain_filename != None:
+            raise Exception("Filename of plain file must not already existed.")
+
+        tmpd = tempfile.mkdtemp()
+        tmpfn = os.path.join(tmpd, RandomString(10))
+        self._plain_base = tmpd
+        self._plain_filename = tmpfn
+
+        OpenSSLDecode(self._secret_filename,
+                      self._plain_filename,
+                      self._pass)
+
+    # create from a plain file.
+    # fn: (string) absolute path
+    # ps: (string) password
+    def createFromPlain(self, fn, ps, target_path):
+        r = False
+        self._plain_filename = fn
+        self._plain_base = fn
+        self._pass = ps
+        self._secret_filename = target_path
+        if self._edit_plain():
+            self._encode()
+            r = True
+        self._clean_plain()
+        return r
+
+    # decode and edit, then store back.
+    # fn: (string) absolute path
+    # ps: (string) password
+    def decodeAndEdit(self, fn, ps):
+        r = False
+        self._secret_filename = fn
+        self._pass = ps
+        self._decode()
+        # edit and store back to original file.
+        if self._edit_plain():
+            self._encode()
+            r = True
+        self._clean_plain()
+        return r
+
+def create():
+    pass1 = getpass.getpass('Enter password for new secret: ')
+    pass2 = getpass.getpass('Confirm password: ')
+    if pass1 != pass2:
+        print_err('Password is not confirmed.')
+        return 1
+
+    sec = SecretFile()
+    tmpfl = tempfile.mkstemp()
+    os.close(tmpfl[0]) # we don't use the file directly.
+    
+    if not sec.createFromPlain(tmpfl[1], pass1,
+                               os.path.join(os.getcwd(), sys.argv[2])):
+        print_err('Failed to edit. Nothing has been changed.')
+        return 1
+    return 0
+    
+def edit():
+    secfn = os.path.join(os.getcwd(), sys.argv[2])
+    ps = getpass.getpass('Password: ')
+    sec = SecretFile()
+    if not sec.decodeAndEdit(secfn, ps):
+        print_err('Failed to edit. Nothing has been changed.')
+        return 1
+    return 0
+
+def main():
+    func_map = {
+        'create' : create,
+        'edit'   : edit,
+        'view'   : 'view'
+    }
+
+    if not sys.argv[1] in func_map:
+        print_err('function: ' + ', '.join(func_map.keys()))
+        return 1
+
+    return func_map[sys.argv[1]]()
+    
+if __name__ == '__main__':
+    sys.exit(main())
